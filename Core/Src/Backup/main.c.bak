@@ -1,0 +1,460 @@
+/* USER CODE BEGIN Header */
+/**
+  ******************************************************************************
+  * @file           : main.c
+  * @brief          : Potentiometre + NanoEdge AI + LCD I2C + Log SD (clair) +
+  *                    Chiffrement AES-128-CBC en continu -> fichier .hex
+  ******************************************************************************
+  */
+/* USER CODE END Header */
+#include "main.h"
+#include "fatfs.h"
+#include "lcd_i2c.h"
+#include "NanoEdgeAI.h"
+#include "aes.h"
+#include <stdio.h>
+#include <string.h>
+
+/* Private define ------------------------------------------------------------*/
+#define FILENAME         "LOG_CSF.txt"   /* log en clair, ne change pas   */
+#define ENC_FILENAME     "ENC_LOG.hex"   /* nouveau fichier chiffre       */
+#define NEAI_BUFFER_SIZE 8
+#define ENC_MSG_MAXLEN   80               /* taille max du message avant padding */
+#define CSF_DEBUG
+
+/* Cle AES 128 bits - A CHANGER pour ton projet, et la MEME cle doit etre
+   utilisee cote Python pour dechiffrer */
+static const uint8_t aes_key[16] = {
+    0x00,0x01,0x02,0x03,0x04,0x05,0x06,0x07,
+    0x08,0x09,0x0A,0x0B,0x0C,0x0D,0x0E,0x0F
+};
+
+/* Private variables ---------------------------------------------------------*/
+ADC_HandleTypeDef  hadc1;
+I2C_HandleTypeDef  hi2c1;
+SD_HandleTypeDef   hsd;
+DMA_HandleTypeDef  hdma_sdio_rx;
+DMA_HandleTypeDef  hdma_sdio_tx;
+UART_HandleTypeDef huart2;
+
+static const char *class_labels[] = {
+    "ARYTHMIE",
+    "BRADYCARDIE",
+    "NORMAL",
+    "TACHYCARDIE"
+};
+
+static float    input_buffer[NEAI_BUFFER_SIZE];
+static float    output_class[4];
+static uint16_t buf_index = 0;
+static uint32_t sample_counter = 0;
+
+/* Private function prototypes -----------------------------------------------*/
+void SystemClock_Config(void);
+static void MX_GPIO_Init(void);
+static void MX_DMA_Init(void);
+static void MX_SDIO_SD_Init(void);
+static void MX_USART2_UART_Init(void);
+static void MX_ADC1_Init(void);
+static void MX_I2C1_Init(void);
+
+static float read_adc_float(void);
+static void  sd_log_line(const char *line);
+static void  uart_send(const char *line);
+static void  generate_iv(uint8_t *iv);
+static void  bytes_to_hex(const uint8_t *data, uint32_t len, char *out);
+static void  encrypt_and_log(const char *plaintext);
+
+/* USER CODE BEGIN 0 */
+static float read_adc_float(void)
+{
+    HAL_ADC_Start(&hadc1);
+    HAL_ADC_PollForConversion(&hadc1, 100);
+    uint32_t raw = HAL_ADC_GetValue(&hadc1);
+    HAL_ADC_Stop(&hadc1);
+    return (float)raw;
+}
+
+/* Ecrit une ligne en clair a la fin du fichier LOG_CSF.txt (inchange) */
+static void sd_log_line(const char *line)
+{
+    UINT bw;
+    if (f_open(&SDFile, FILENAME, FA_OPEN_APPEND | FA_WRITE) != FR_OK)
+    {
+#ifdef CSF_DEBUG
+        uart_send("Erreur ouverture fichier SD (log)\n");
+#endif
+        return;
+    }
+    f_write(&SDFile, line, strlen(line), &bw);
+    f_close(&SDFile);
+}
+
+static void uart_send(const char *line)
+{
+    HAL_UART_Transmit(&huart2, (uint8_t*)line, strlen(line), 100);
+}
+
+/* Genere un IV de 16 octets a partir du tick systeme + compteur.
+   NOTE: ce n'est pas un generateur cryptographiquement sur, mais il garantit
+   un IV different a chaque appui, ce qui est le minimum requis pour CBC. */
+static void generate_iv(uint8_t *iv)
+{
+    uint32_t tick = HAL_GetTick();
+    uint32_t cnt  = sample_counter;
+
+    for (int i = 0; i < 4; i++) iv[i]     = (uint8_t)(tick >> (i * 8));
+    for (int i = 0; i < 4; i++) iv[4 + i] = (uint8_t)(cnt  >> (i * 8));
+    for (int i = 8; i < 16; i++) iv[i]    = (uint8_t)(0xA5 ^ i ^ (tick >> (i % 4)));
+}
+
+static void bytes_to_hex(const uint8_t *data, uint32_t len, char *out)
+{
+    static const char hexchars[] = "0123456789ABCDEF";
+    for (uint32_t i = 0; i < len; i++)
+    {
+        out[i * 2]     = hexchars[(data[i] >> 4) & 0x0F];
+        out[i * 2 + 1] = hexchars[data[i] & 0x0F];
+    }
+    out[len * 2] = '\0';
+}
+
+/* Chiffre "plaintext" en AES-128-CBC (avec padding PKCS7) et ecrit une ligne
+   "IV_hex:CIPHER_hex\n" a la fin du fichier ENC_LOG.hex. Chaque appel est
+   independant (IV propre), donc chaque ligne peut etre dechiffree seule. */
+static void encrypt_and_log(const char *plaintext)
+{
+    struct AES_ctx ctx;
+    uint8_t  iv[AES_BLOCKLEN];
+    uint8_t  buf[ENC_MSG_MAXLEN + AES_BLOCKLEN];
+    char     hex_iv[AES_BLOCKLEN * 2 + 1];
+    char     hex_cipher[sizeof(buf) * 2 + 1];
+    char     line[400];
+    UINT     bw;
+
+    uint32_t msg_len = (uint32_t)strlen(plaintext);
+    if (msg_len > ENC_MSG_MAXLEN) msg_len = ENC_MSG_MAXLEN; /* garde-fou */
+
+    uint32_t padded_len = ((msg_len / AES_BLOCKLEN) + 1) * AES_BLOCKLEN; /* PKCS7: toujours >= 1 octet de pad */
+    uint8_t  pad_val = (uint8_t)(padded_len - msg_len);
+
+    memset(buf, 0, sizeof(buf));
+    memcpy(buf, plaintext, msg_len);
+    for (uint32_t i = msg_len; i < padded_len; i++)
+    {
+        buf[i] = pad_val;
+    }
+
+    generate_iv(iv);
+    AES_init_ctx_iv(&ctx, aes_key, iv);
+    AES_CBC_encrypt_buffer(&ctx, buf, padded_len);
+
+    bytes_to_hex(iv, AES_BLOCKLEN, hex_iv);
+    bytes_to_hex(buf, padded_len, hex_cipher);
+
+    snprintf(line, sizeof(line), "%s:%s\n", hex_iv, hex_cipher);
+
+    if (f_open(&SDFile, ENC_FILENAME, FA_OPEN_APPEND | FA_WRITE) == FR_OK)
+    {
+        f_write(&SDFile, line, strlen(line), &bw);
+        f_close(&SDFile);
+#ifdef CSF_DEBUG
+        uart_send("Ligne chiffree ecrite\n");
+#endif
+    }
+#ifdef CSF_DEBUG
+    else
+    {
+        uart_send("Erreur ouverture fichier ENC\n");
+    }
+#endif
+}
+
+/* USER CODE END 0 */
+
+/**
+  * @brief  The application entry point.
+  */
+int main(void)
+{
+    char line0[17];
+    char line1[17];
+    char log_buf[80];
+    uint8_t best_class = 0;
+    uint32_t voltage_mv;
+
+    HAL_Init();
+    SystemClock_Config();
+
+    MX_GPIO_Init();
+    MX_DMA_Init();
+    MX_SDIO_SD_Init();
+    MX_FATFS_Init();
+    MX_USART2_UART_Init();
+    MX_ADC1_Init();
+    MX_I2C1_Init();
+
+    /* --- Init carte SD --- */
+    if (HAL_SD_Init(&hsd) != HAL_OK)
+    {
+        Error_Handler();
+    }
+
+    if (f_mount(&SDFatFS, (TCHAR const*) SDPath, 0) != FR_OK)
+    {
+#ifdef CSF_DEBUG
+        uart_send("Impossible de monter le disque\n");
+#endif
+        Error_Handler();
+    }
+
+    /* --- Init LCD --- */
+    LCD_Init(&hi2c1);
+    LCD_Clear();
+    LCD_SetCursor(0, 0);
+    LCD_Print("  Cardiac  AI   ");
+    LCD_SetCursor(0, 1);
+    LCD_Print(" Initializing...");
+    HAL_Delay(1000);
+
+    /* --- Init NanoEdge AI --- */
+    if (neai_classification_init() != NEAI_OK)
+    {
+        LCD_Clear();
+        LCD_SetCursor(0, 0);
+        LCD_Print("NEAI INIT ERROR!");
+        Error_Handler();
+    }
+
+    LCD_Clear();
+    LCD_SetCursor(0, 0);
+    LCD_Print("  Cardiac  AI   ");
+    LCD_SetCursor(0, 1);
+    LCD_Print("  Ready!        ");
+    HAL_Delay(800);
+
+    snprintf(log_buf, sizeof(log_buf), "\n--- Nouvelle session ---\n");
+    sd_log_line(log_buf);
+
+    /* Infinite loop */
+    while (1)
+    {
+        /* --- Lecture potentiometre --- */
+        float sample = read_adc_float();
+        input_buffer[buf_index++] = sample;
+        sample_counter++;
+
+        voltage_mv  = (uint32_t)(sample * 3300.0f / 4095.0f);
+
+        LCD_SetCursor(0, 0);
+        snprintf(line0, sizeof(line0), "ADC:%4d V:%4lumV", (int)sample, voltage_mv);
+        LCD_Print(line0);
+        LCD_SetCursor(0, 1);
+        snprintf(line1, sizeof(line1), "Collecting %d/8  ", buf_index);
+        LCD_Print(line1);
+
+        /* Log brut en clair sur SD (inchange) */
+        snprintf(log_buf, sizeof(log_buf), "N:%lu,ADC:%d,V:%lumV\n",
+                 sample_counter, (int)sample, voltage_mv);
+        sd_log_line(log_buf);
+
+        /* Chiffrement automatique de la meme donnee -> fichier .hex */
+        encrypt_and_log(log_buf);
+
+        /* Envoi UART vers ESP32 */
+        snprintf(log_buf, sizeof(log_buf), "ADC:%d\n", (int)sample);
+        uart_send(log_buf);
+
+        if (buf_index < NEAI_BUFFER_SIZE)
+        {
+            HAL_Delay(50);
+            continue;
+        }
+
+        /* Buffer plein -> classification */
+        buf_index = 0;
+        neai_classification(input_buffer, output_class, &best_class);
+        uint8_t confidence = (uint8_t)(output_class[best_class] * 100.0f);
+
+        LCD_Clear();
+        LCD_SetCursor(0, 0);
+        snprintf(line0, sizeof(line0), "%-16s", class_labels[best_class]);
+        LCD_Print(line0);
+        LCD_SetCursor(0, 1);
+        snprintf(line1, sizeof(line1), "Conf: %3d%%       ", confidence);
+        LCD_Print(line1);
+
+        snprintf(log_buf, sizeof(log_buf), "CLASS:%s,CONF:%d\n",
+                 class_labels[best_class], confidence);
+        sd_log_line(log_buf);
+
+        /* Chiffrement automatique de la meme donnee -> fichier .hex */
+        encrypt_and_log(log_buf);
+
+        snprintf(log_buf, sizeof(log_buf), "CLASS:%s:CONF:%d\n",
+                 class_labels[best_class], confidence);
+        uart_send(log_buf);
+
+        HAL_Delay(1000);
+    }
+}
+
+/**
+  * @brief System Clock Configuration
+  */
+void SystemClock_Config(void)
+{
+    RCC_OscInitTypeDef RCC_OscInitStruct = {0};
+    RCC_ClkInitTypeDef RCC_ClkInitStruct = {0};
+
+    __HAL_RCC_PWR_CLK_ENABLE();
+    __HAL_PWR_VOLTAGESCALING_CONFIG(PWR_REGULATOR_VOLTAGE_SCALE1);
+
+    RCC_OscInitStruct.OscillatorType = RCC_OSCILLATORTYPE_HSI;
+    RCC_OscInitStruct.HSIState = RCC_HSI_ON;
+    RCC_OscInitStruct.HSICalibrationValue = RCC_HSICALIBRATION_DEFAULT;
+    RCC_OscInitStruct.PLL.PLLState = RCC_PLL_ON;
+    RCC_OscInitStruct.PLL.PLLSource = RCC_PLLSOURCE_HSI;
+    RCC_OscInitStruct.PLL.PLLM = 8;
+    RCC_OscInitStruct.PLL.PLLN = 168;
+    RCC_OscInitStruct.PLL.PLLP = RCC_PLLP_DIV2;
+    RCC_OscInitStruct.PLL.PLLQ = 7;
+    if (HAL_RCC_OscConfig(&RCC_OscInitStruct) != HAL_OK)
+    {
+        Error_Handler();
+    }
+
+    RCC_ClkInitStruct.ClockType = RCC_CLOCKTYPE_HCLK | RCC_CLOCKTYPE_SYSCLK
+                                 | RCC_CLOCKTYPE_PCLK1 | RCC_CLOCKTYPE_PCLK2;
+    RCC_ClkInitStruct.SYSCLKSource = RCC_SYSCLKSOURCE_PLLCLK;
+    RCC_ClkInitStruct.AHBCLKDivider = RCC_SYSCLK_DIV1;
+    RCC_ClkInitStruct.APB1CLKDivider = RCC_HCLK_DIV4;
+    RCC_ClkInitStruct.APB2CLKDivider = RCC_HCLK_DIV2;
+
+    if (HAL_RCC_ClockConfig(&RCC_ClkInitStruct, FLASH_LATENCY_5) != HAL_OK)
+    {
+        Error_Handler();
+    }
+}
+
+static void MX_ADC1_Init(void)
+{
+    ADC_ChannelConfTypeDef sConfig = {0};
+
+    hadc1.Instance = ADC1;
+    hadc1.Init.ClockPrescaler = ADC_CLOCK_SYNC_PCLK_DIV2;
+    hadc1.Init.Resolution = ADC_RESOLUTION_12B;
+    hadc1.Init.ScanConvMode = DISABLE;
+    hadc1.Init.ContinuousConvMode = DISABLE;
+    hadc1.Init.DiscontinuousConvMode = DISABLE;
+    hadc1.Init.ExternalTrigConvEdge = ADC_EXTERNALTRIGCONVEDGE_NONE;
+    hadc1.Init.ExternalTrigConv = ADC_SOFTWARE_START;
+    hadc1.Init.DataAlign = ADC_DATAALIGN_RIGHT;
+    hadc1.Init.NbrOfConversion = 1;
+    hadc1.Init.DMAContinuousRequests = DISABLE;
+    hadc1.Init.EOCSelection = ADC_EOC_SINGLE_CONV;
+    if (HAL_ADC_Init(&hadc1) != HAL_OK)
+    {
+        Error_Handler();
+    }
+
+    sConfig.Channel = ADC_CHANNEL_1;   /* PA1 - a adapter selon ton branchement */
+    sConfig.Rank = 1;
+    sConfig.SamplingTime = ADC_SAMPLETIME_3CYCLES;
+    if (HAL_ADC_ConfigChannel(&hadc1, &sConfig) != HAL_OK)
+    {
+        Error_Handler();
+    }
+}
+
+static void MX_I2C1_Init(void)
+{
+    hi2c1.Instance = I2C1;
+    hi2c1.Init.ClockSpeed = 100000;
+    hi2c1.Init.DutyCycle = I2C_DUTYCYCLE_2;
+    hi2c1.Init.OwnAddress1 = 0;
+    hi2c1.Init.AddressingMode = I2C_ADDRESSINGMODE_7BIT;
+    hi2c1.Init.DualAddressMode = I2C_DUALADDRESS_DISABLE;
+    hi2c1.Init.OwnAddress2 = 0;
+    hi2c1.Init.GeneralCallMode = I2C_GENERALCALL_DISABLE;
+    hi2c1.Init.NoStretchMode = I2C_NOSTRETCH_DISABLE;
+    if (HAL_I2C_Init(&hi2c1) != HAL_OK)
+    {
+        Error_Handler();
+    }
+}
+
+static void MX_SDIO_SD_Init(void)
+{
+    hsd.Instance = SDIO;
+    hsd.Init.ClockEdge = SDIO_CLOCK_EDGE_RISING;
+    hsd.Init.ClockBypass = SDIO_CLOCK_BYPASS_DISABLE;
+    hsd.Init.ClockPowerSave = SDIO_CLOCK_POWER_SAVE_DISABLE;
+    hsd.Init.BusWide = SDIO_BUS_WIDE_1B;
+    hsd.Init.HardwareFlowControl = SDIO_HARDWARE_FLOW_CONTROL_DISABLE;
+    hsd.Init.ClockDiv = 0;
+}
+
+static void MX_USART2_UART_Init(void)
+{
+    huart2.Instance = USART2;
+    huart2.Init.BaudRate = 115200;
+    huart2.Init.WordLength = UART_WORDLENGTH_8B;
+    huart2.Init.StopBits = UART_STOPBITS_1;
+    huart2.Init.Parity = UART_PARITY_NONE;
+    huart2.Init.Mode = UART_MODE_TX_RX;
+    huart2.Init.HwFlowCtl = UART_HWCONTROL_NONE;
+    huart2.Init.OverSampling = UART_OVERSAMPLING_16;
+    if (HAL_UART_Init(&huart2) != HAL_OK)
+    {
+        Error_Handler();
+    }
+}
+
+static void MX_DMA_Init(void)
+{
+    __HAL_RCC_DMA2_CLK_ENABLE();
+
+    HAL_NVIC_SetPriority(DMA2_Stream3_IRQn, 0, 0);
+    HAL_NVIC_EnableIRQ(DMA2_Stream3_IRQn);
+
+    HAL_NVIC_SetPriority(DMA2_Stream6_IRQn, 0, 0);
+    HAL_NVIC_EnableIRQ(DMA2_Stream6_IRQn);
+}
+
+/**
+  * @brief GPIO Initialization Function
+  */
+static void MX_GPIO_Init(void)
+{
+    GPIO_InitTypeDef GPIO_InitStruct = {0};
+
+    __HAL_RCC_GPIOH_CLK_ENABLE();
+    __HAL_RCC_GPIOA_CLK_ENABLE();
+    __HAL_RCC_GPIOB_CLK_ENABLE();
+    __HAL_RCC_GPIOD_CLK_ENABLE();
+    __HAL_RCC_GPIOC_CLK_ENABLE();
+
+    HAL_GPIO_WritePin(GPIOD, GPIO_PIN_12 | GPIO_PIN_13 | GPIO_PIN_14 | GPIO_PIN_15, GPIO_PIN_RESET);
+
+    GPIO_InitStruct.Pin = GPIO_PIN_12 | GPIO_PIN_13 | GPIO_PIN_14 | GPIO_PIN_15;
+    GPIO_InitStruct.Mode = GPIO_MODE_OUTPUT_PP;
+    GPIO_InitStruct.Pull = GPIO_NOPULL;
+    GPIO_InitStruct.Speed = GPIO_SPEED_FREQ_LOW;
+    HAL_GPIO_Init(GPIOD, &GPIO_InitStruct);
+}
+
+void Error_Handler(void)
+{
+    __disable_irq();
+    HAL_GPIO_WritePin(GPIOD, GPIO_PIN_14, GPIO_PIN_SET);
+    while (1)
+    {
+    }
+}
+
+#ifdef USE_FULL_ASSERT
+void assert_failed(uint8_t *file, uint32_t line)
+{
+}
+#endif
